@@ -1,0 +1,7 @@
+# PyInstaller build output
+/dist/
+/build/
+/build_pyi/
+*.spec
+__pycache__/
+*.pyc
