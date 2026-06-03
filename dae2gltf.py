@@ -1,90 +1,114 @@
 #!/usr/bin/env python3
-# DAE-2-glTF — a small GUI to convert COLLADA (.dae) files to glTF binary (.glb).
+# DAE-2-glTF — a small standalone GUI to convert COLLADA (.dae) to glTF (.glb).
 #
-# Drop in .dae files, click Convert, get .glb out. Skinning and animation are
+# Add .dae files, click Convert, get .glb out. Skinning and animation are
 # preserved (rigged models stay rigged).
 #
-# Run:  python dae2gltf.py      (or double-click on Windows)
+# Self-contained: the conversion is done in-process through the bundled
+# Open Asset Import Library (assimp) via its C API — no Blender, no external
+# tools. assimp is BSD-3-Clause (see THIRDPARTY/assimp-LICENSE).
 #
-# Under the hood it drives a Blender install in headless mode to do the actual
-# COLLADA->glTF work, because re-implementing skinned-COLLADA parsing from
-# scratch is huge and fragile while Blender already does it well. The GUI
-# auto-detects Blender; if it can't, point it at blender.exe with "Browse".
+# Run:  python dae2gltf.py     (or run the packaged .exe)
 
 import os
 import sys
 import glob
-import shutil
-import tempfile
+import ctypes
 import threading
-import subprocess
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 APP_TITLE = "DAE-2-glTF"
 
-# Headless Blender script: empty scene -> import .dae -> export .glb (rig kept).
-_BLENDER_SCRIPT = r'''
-import bpy, sys, os
-argv = sys.argv[sys.argv.index("--") + 1:]
-src, dst = argv[0], argv[1]
-bpy.ops.wm.read_factory_settings(use_empty=True)
-if not hasattr(bpy.ops.wm, "collada_import"):
-    print("DAE2GLTF_ERR: this Blender build has no COLLADA importer")
-    sys.exit(2)
-bpy.ops.wm.collada_import(filepath=src)
-os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
-bpy.ops.export_scene.gltf(
-    filepath=dst, export_format="GLB",
-    export_skins=True, export_animations=True, export_yup=True,
-    export_apply=False, export_tangents=True, export_normals=True,
-    export_texcoords=True, export_materials="EXPORT")
-print("DAE2GLTF_OK")
-'''
+# assimp post-process: triangulate (glTF only allows triangles) + drop degenerate
+# tris. Keep it minimal so the model stays faithful (we don't regenerate normals).
+_AI_PROCESS = 0x8 | 0x100000  # aiProcess_Triangulate | aiProcess_FindDegenerates
 
 
-def find_blender():
-    """Best-effort locate a Blender executable."""
-    p = shutil.which("blender")
-    if p:
-        return p
-    pats = [
-        r"C:\Program Files\Blender Foundation\Blender*\blender.exe",
-        r"C:\Program Files (x86)\Blender Foundation\Blender*\blender.exe",
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-        "/usr/bin/blender", "/usr/local/bin/blender",
-        os.path.expanduser("~/Applications/Blender.app/Contents/MacOS/Blender"),
-    ]
-    hits = []
-    for pat in pats:
-        hits += glob.glob(pat)
-    # Prefer the highest-versioned match.
-    hits.sort(reverse=True)
-    return hits[0] if hits else ""
+def _dll_candidates():
+    names = ["assimp-vc143-mt.dll", "assimp.dll", "libassimp.so", "libassimp.dylib"]
+    bases = []
+    if hasattr(sys, "_MEIPASS"):                       # PyInstaller bundle
+        bases.append(sys._MEIPASS)
+    try:
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    bases.append(os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else "")
+    bases.append(os.getcwd())
+    for b in bases:
+        for n in names:
+            p = os.path.join(b, n)
+            if os.path.exists(p):
+                yield p
+
+
+class Assimp:
+    """Thin ctypes wrapper over assimp's C import/export API."""
+
+    def __init__(self):
+        self.path = next(_dll_candidates(), "")
+        if not self.path:
+            raise FileNotFoundError("assimp library not found next to the app")
+        d = ctypes.CDLL(self.path)
+        d.aiImportFile.restype = ctypes.c_void_p
+        d.aiImportFile.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+        d.aiExportScene.restype = ctypes.c_int
+        d.aiExportScene.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        d.aiReleaseImport.argtypes = [ctypes.c_void_p]
+        d.aiGetErrorString.restype = ctypes.c_char_p
+        self.d = d
+
+    def _err(self):
+        msg = self.d.aiGetErrorString()
+        return msg.decode("utf-8", "replace") if msg else ""
+
+    def convert(self, src, dst):
+        scene = self.d.aiImportFile(src.encode("utf-8"), _AI_PROCESS)
+        if not scene:
+            raise RuntimeError(self._err() or "import failed")
+        try:
+            d = os.path.dirname(os.path.abspath(dst))
+            if d:
+                os.makedirs(d, exist_ok=True)
+            fmt = b"glb2" if dst.lower().endswith(".glb") else b"gltf2"
+            ret = self.d.aiExportScene(scene, fmt, dst.encode("utf-8"), 0)
+            if ret != 0:
+                raise RuntimeError(self._err() or ("export failed (code %d)" % ret))
+        finally:
+            self.d.aiReleaseImport(scene)
 
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("640x520")
-        root.minsize(520, 440)
+        root.geometry("620x500")
+        root.minsize(500, 420)
 
-        self.blender = tk.StringVar(value=find_blender())
+        try:
+            self.engine = Assimp()
+            self.engine_err = ""
+        except Exception as e:
+            self.engine = None
+            self.engine_err = str(e)
+
         self.same_dir = tk.BooleanVar(value=True)
         self.out_dir = tk.StringVar(value="")
-        self.files = []   # input .dae paths
-
+        self.files = []
         pad = {"padx": 8, "pady": 4}
 
-        # --- Blender path row ---
-        bf = ttk.LabelFrame(root, text="Blender (conversion engine)")
-        bf.pack(fill="x", **pad)
-        ttk.Entry(bf, textvariable=self.blender).pack(side="left", fill="x", expand=True, padx=6, pady=6)
-        ttk.Button(bf, text="Browse…", command=self.pick_blender).pack(side="left", padx=6)
+        # Engine status
+        ef = ttk.Frame(root)
+        ef.pack(fill="x", **pad)
+        if self.engine:
+            ttk.Label(ef, text="Engine: assimp (bundled) — no Blender needed").pack(side="left")
+        else:
+            ttk.Label(ef, text="assimp library missing — see THIRDPARTY/assimp-LICENSE",
+                      foreground="red").pack(side="left")
 
-        # --- Input files ---
+        # Input files
         inf = ttk.LabelFrame(root, text="Input .dae files")
         inf.pack(fill="both", expand=True, **pad)
         self.listbox = tk.Listbox(inf, selectmode="extended")
@@ -99,7 +123,7 @@ class App:
         ttk.Button(btns, text="Remove", command=self.remove_sel).pack(fill="x", pady=2)
         ttk.Button(btns, text="Clear", command=self.clear).pack(fill="x", pady=2)
 
-        # --- Output ---
+        # Output
         of = ttk.LabelFrame(root, text="Output")
         of.pack(fill="x", **pad)
         ttk.Checkbutton(of, text="Write .glb next to each .dae",
@@ -111,36 +135,29 @@ class App:
         self.out_btn = ttk.Button(orow, text="Folder…", command=self.pick_out, state="disabled")
         self.out_btn.pack(side="left", padx=6)
 
-        # --- Convert + log ---
+        # Convert + log
         cf = ttk.Frame(root)
         cf.pack(fill="x", **pad)
         self.convert_btn = ttk.Button(cf, text="Convert", command=self.start)
         self.convert_btn.pack(side="left")
+        if not self.engine:
+            self.convert_btn.config(state="disabled")
         self.progress = ttk.Progressbar(cf, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=8)
 
         self.log = scrolledtext.ScrolledText(root, height=8, state="disabled")
         self.log.pack(fill="both", expand=False, **pad)
+        if self.engine_err:
+            self._log("Error: " + self.engine_err)
 
-        if not self.blender.get():
-            self._log("Blender not found automatically — set its path above.")
-
-    # ---- UI helpers ----
     def _toggle_out(self):
         state = "disabled" if self.same_dir.get() else "normal"
         self.out_entry.config(state=state)
         self.out_btn.config(state=state)
 
-    def pick_blender(self):
-        f = filedialog.askopenfilename(title="Locate Blender",
-                                       filetypes=[("Blender", "blender.exe blender Blender"), ("All", "*.*")])
-        if f:
-            self.blender.set(f)
-
     def add_files(self):
-        fs = filedialog.askopenfilenames(title="Add .dae files",
-                                         filetypes=[("COLLADA", "*.dae"), ("All", "*.*")])
-        for f in fs:
+        for f in filedialog.askopenfilenames(title="Add .dae files",
+                                             filetypes=[("COLLADA", "*.dae"), ("All", "*.*")]):
             if f not in self.files:
                 self.files.append(f)
                 self.listbox.insert("end", f)
@@ -174,11 +191,8 @@ class App:
         self.log.see("end")
         self.log.config(state="disabled")
 
-    # ---- Conversion ----
     def start(self):
-        blender = self.blender.get().strip()
-        if not blender or not os.path.exists(blender):
-            messagebox.showerror(APP_TITLE, "Set a valid Blender executable path first.")
+        if not self.engine:
             return
         if not self.files:
             messagebox.showerror(APP_TITLE, "Add at least one .dae file.")
@@ -187,7 +201,7 @@ class App:
             messagebox.showerror(APP_TITLE, "Pick an output folder (or tick 'next to each .dae').")
             return
         self.convert_btn.config(state="disabled")
-        threading.Thread(target=self._run, args=(blender, list(self.files)), daemon=True).start()
+        threading.Thread(target=self._run, args=(list(self.files),), daemon=True).start()
 
     def _out_path(self, src):
         name = os.path.splitext(os.path.basename(src))[0] + ".glb"
@@ -195,35 +209,19 @@ class App:
             return os.path.join(os.path.dirname(src), name)
         return os.path.join(self.out_dir.get().strip(), name)
 
-    def _run(self, blender, files):
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
-            tf.write(_BLENDER_SCRIPT)
-            script = tf.name
+    def _run(self, files):
         self.progress.config(maximum=len(files), value=0)
         ok = 0
-        try:
-            for i, src in enumerate(files, 1):
-                dst = self._out_path(src)
-                self._log("[%d/%d] %s" % (i, len(files), os.path.basename(src)))
-                try:
-                    proc = subprocess.run(
-                        [blender, "--background", "--python", script, "--", src, dst],
-                        capture_output=True, text=True, timeout=600)
-                    out = (proc.stdout or "") + (proc.stderr or "")
-                    if "DAE2GLTF_OK" in out and os.path.exists(dst):
-                        self._log("    -> %s" % dst)
-                        ok += 1
-                    else:
-                        tail = out.strip().splitlines()[-1] if out.strip() else "no output"
-                        self._log("    FAILED: %s" % tail)
-                except Exception as e:
-                    self._log("    FAILED: %s" % e)
-                self.progress.config(value=i)
-        finally:
+        for i, src in enumerate(files, 1):
+            dst = self._out_path(src)
+            self._log("[%d/%d] %s" % (i, len(files), os.path.basename(src)))
             try:
-                os.remove(script)
-            except OSError:
-                pass
+                self.engine.convert(src, dst)
+                self._log("    -> %s" % dst)
+                ok += 1
+            except Exception as e:
+                self._log("    FAILED: %s" % e)
+            self.progress.config(value=i)
         self._log("Done: %d/%d converted." % (ok, len(files)))
         self.convert_btn.config(state="normal")
 

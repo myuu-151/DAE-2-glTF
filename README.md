@@ -1,54 +1,54 @@
 # DAE-2-glTF
 
-A small **GUI** that converts COLLADA `.dae` files to glTF binary `.glb`.
+A small **standalone GUI** that converts COLLADA `.dae` files to glTF binary
+`.glb` — **no Blender, no dependencies**.
 
 Add your `.dae` files, click **Convert**, get `.glb` out. **Skinning and
 animation are preserved**, so rigged models stay rigged.
 
-![flow](https://img.shields.io/badge/.dae-%E2%86%92%20.glb-blue)
-
 ## Run
+
+**Easiest:** grab `DAE-2-glTF.exe` from [Releases](../../releases) and run it.
+Everything is bundled — nothing to install.
+
+**From source:**
 
 ```sh
 python dae2gltf.py
 ```
 
-(On Windows you can also just double-click `dae2gltf.py`.)
+Needs Python 3 with Tkinter (ships with the standard installer on Windows/macOS;
+`apt install python3-tk` on Linux) and the `assimp-vc143-mt.dll` that sits next
+to `dae2gltf.py` in this repo.
 
-Needs **Python 3** with Tkinter — that ships with the standard Python installer
-on Windows/macOS; on Linux install `python3-tk`.
+## How it works
 
-## How it works (and what it needs)
-
-The actual COLLADA→glTF conversion is done by **Blender in the background** —
-reimplementing skinned-COLLADA parsing from scratch is large and brittle, while
-Blender already does it well. So the GUI is a friendly front-end that drives a
-Blender install for you:
-
-- It **auto-detects** Blender (PATH + the usual install folders).
-- If it can't find it, click **Browse…** and point it at `blender.exe`
-  (Windows) / the `Blender` binary (macOS/Linux).
-- You never have to open Blender or write a script — the GUI runs it headless.
-
-[Download Blender](https://www.blender.org/download/) if you don't have it. Any
-4.x build works (the COLLADA importer is included).
+The conversion runs **in-process** through the [Open Asset Import Library
+(assimp)](https://github.com/assimp/assimp) via its C API (`aiImportFile` →
+`aiExportScene "glb2"`). assimp reads COLLADA (geometry, skinning, animation)
+and writes glTF 2.0, so the whole thing is one self-contained program — there's
+no Blender or command-line tool to find.
 
 ## Features
 
 - Add individual `.dae` files or a **whole folder** (recursive).
 - Output **next to each `.dae`** or into a chosen folder.
 - **Batch** convert with a progress bar and per-file log.
-- Exports `.glb` with skins, animations, normals, tangents, texcoords, and
-  materials (Y-up).
+- Meshes are triangulated on export (glTF only allows triangles).
 
 ## Notes
 
-- Each file converts in a fresh, empty Blender scene, so batches don't bleed
-  together; failures are logged and skipped (the rest keep going).
-- Prefer no Blender at all? [`assimp`](https://github.com/assimp/assimp) can
-  convert from the command line (`assimp export in.dae out.glb`), though its
-  glTF skin export is less consistent than Blender's.
+- Why assimp and not Blender? Blender 5.0 **removed** COLLADA import, and a
+  from-scratch skinned-COLLADA parser is huge and brittle. assimp does it well
+  and is tiny to bundle.
+- assimp's COLLADA import is solid; its glTF export is good but not perfect on
+  exotic rigs — if a clip looks off, the source `.dae` is usually the culprit.
+
+## Third-party
+
+Bundles the assimp library (`assimp-vc143-mt.dll`), BSD-3-Clause — see
+[`THIRDPARTY/assimp-LICENSE`](THIRDPARTY/assimp-LICENSE).
 
 ## License
 
-MIT.
+MIT (this tool).
