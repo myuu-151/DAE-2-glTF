@@ -11,6 +11,7 @@
 # Run:  python dae2gltf.py     (or run the packaged .exe)
 
 import os
+import re
 import sys
 import glob
 import ctypes
@@ -42,6 +43,46 @@ def _dll_candidates():
             p = os.path.join(b, n)
             if os.path.exists(p):
                 yield p
+
+
+_ID_ATTR = re.compile(rb'\bid="([^"]+)"')
+_REF_ATTR = re.compile(rb'\b(source|url)="([^"#][^"]*)"')
+_SKEL_TEXT = re.compile(rb'(<skeleton>)([^<#][^<]*)(</skeleton>)')
+
+
+def sanitize_dae(src):
+    """Fix bare local references some exporters write (source="Foo-array"
+    instead of source="#Foo-array") — assimp rejects them with "Unknown
+    reference format in url". Only values that match an id actually defined
+    in the document get the '#' prepended, so external URIs are untouched.
+    Returns (path_to_use, fix_count); writes a temp .dae NEXT TO the source
+    (relative texture paths must keep resolving) when fixes were needed."""
+    with open(src, "rb") as f:
+        data = f.read()
+    ids = set(_ID_ATTR.findall(data))
+    fixes = [0]
+
+    def fix_attr(m):
+        if m.group(2) in ids:
+            fixes[0] += 1
+            return m.group(1) + b'="#' + m.group(2) + b'"'
+        return m.group(0)
+
+    def fix_skel(m):
+        if m.group(2).strip() in ids:
+            fixes[0] += 1
+            return m.group(1) + b'#' + m.group(2) + m.group(3)
+        return m.group(0)
+
+    data = _REF_ATTR.sub(fix_attr, data)
+    data = _SKEL_TEXT.sub(fix_skel, data)
+    if not fixes[0]:
+        return src, 0
+    tmp = os.path.join(os.path.dirname(os.path.abspath(src)),
+                       "." + os.path.basename(src) + ".d2g_tmp.dae")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    return tmp, fixes[0]
 
 
 class Assimp:
@@ -215,12 +256,23 @@ class App:
         for i, src in enumerate(files, 1):
             dst = self._out_path(src)
             self._log("[%d/%d] %s" % (i, len(files), os.path.basename(src)))
+            tmp = None
             try:
-                self.engine.convert(src, dst)
+                use, nfix = sanitize_dae(src)
+                if nfix:
+                    tmp = use
+                    self._log("    fixed %d bare reference(s) (missing '#')" % nfix)
+                self.engine.convert(use, dst)
                 self._log("    -> %s" % dst)
                 ok += 1
             except Exception as e:
                 self._log("    FAILED: %s" % e)
+            finally:
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
             self.progress.config(value=i)
         self._log("Done: %d/%d converted." % (ok, len(files)))
         self.convert_btn.config(state="normal")
